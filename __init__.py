@@ -1,136 +1,169 @@
-"""
-starts at 2/01/2009
-saturdays and sundays there are not publications
-some special days like national holidays there are not publications
-base url: https://www.boe.es/diario_borme/
-calendar uri: https://www.boe.es/diario_borme/calendarios.php
-sample calendar uri: https://www.boe.es/borme/dias/2019/01/17/ y/m/d
-TODO:
-    download one document  in a day
-    download all documents in a week
-    download all documents in a month
-    download all documents in a year
-    UTC should be configurable
-"""
-
-import os
 import datetime
 from urllib.parse import urljoin
-from functools import reduce
-import aiohttp
-import asyncio
+import requests
 from bs4 import BeautifulSoup
 
 
-class SummaryResource:
-    url_base = 'https://boe.es/diario_borme/xml.php'
+class DateInRange:
+    """
+    check date_from <= date_to
+    """
+    date_from = datetime.date(2009, 1, 1)
+
+    date_to = datetime.date.today()
 
     def __init__(self, date):
-        """
-        date should be from 2009/01/01 to today
-        """
-        self.__date = date
+        if self.date_from <= date <= self.date_to:
+            self.__date = date
+        else:
+            raise ValueError('date must be in {}..{}'.format(self.date_from, self.date_to))
+
+    def __get__(self):
+        return self.__date
+
+
+class DocPDF:
+    url_base = 'https://boe.es/'
+
+    def __init__(self, url):
+        self.__url = urljoin(self.url_base, url)
 
     @property
     def content(self):
-        """
-        remove the file write part, this class should just
-        download documents
-        check status code
-        """
+        return requests.get(self.__url).content
 
-        async def _fetch():
-            params = {'id': 'BORME-S-' + self.__date.strftime('%Y%m%d')}
-            async with aiohttp.ClientSession() as session:
-                async with session.get(self.url_base, params=params) as response:
-                    return await response.read()
 
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(_fetch())
+class SummaryXML:
+    url_base = 'https://boe.es/diario_borme/xml.php'
+
+    date_from = datetime.date(2009, 1, 1)
+
+    date_to = datetime.date.today()
+
+    def __init__(self, date):
+        if self.date_from <= date <= self.date_to:
+            self.__date = date
+        else:
+            raise ValueError('date must be in {}..{}'.format(self.date_from, self.date_to))
+
+    @property
+    def content(self):
+        params = {'id': 'BORME-S-' + self.__date.strftime('%Y%m%d')}
+        r = requests.get(self.url_base, params=params)
+        return r.content
 
     @property
     def content1(self):
-        with open('summary.xml', 'rb') as f:
+        with open('files/summary.xml', 'rb') as f:
             return f.read()
+
+
+class Province:
+
+    def __init__(self, name, url, size):
+        self.__name = name
+        self.__url = url
+        self.__size = size
+
+    @property
+    def name(self):
+        return self.__name.strip().lower()
+
+    @property
+    def url(self):
+        return self.__url
+
+    @property
+    def size(self):
+        return int(self.__size)
+
+
+class SummaryParsed:
+
+    def __init__(self, summaryXML):
+        self.__summaryXML = summaryXML
+
+    @property
+    def __soup(self):
+        return BeautifulSoup(self.__summaryXML.content, 'xml')
+
+    @property
+    def date_next(self):
+        if self.__soup.sumario.meta.fechaSig.string:
+            day, month, year = map(
+                lambda x: int(x.lstrip('0')),
+                self.__soup.sumario.meta.fechaSig.string.split('/')
+            )
+            return datetime.date(year, month, day)
+        else:
+            return None
+
+    def province_by_name(self, name):
+        province_xml = self.__soup.find('titulo', string=name).parent
+        if province_xml:
+            return Province(
+                name=province_xml.titulo.string,
+                url=province_xml.urlPdf.string,
+                size=province_xml.urlPdf['szBytes']
+            )
+        else:
+            return None
 
 
 class Summary:
 
-    def __init__(self, summary):
-        self.__summary = summary
+    def __init__(self, summaryParsed):
+        self.__summaryParsed = summaryParsed
 
     @property
-    def __parsed(self):
-        """
-        memoize
-        check exceptions
-        :return:
-        """
-        return BeautifulSoup(self.__summary.content1, 'xml')
+    def date_next(self):
+        return self.__summaryParsed.date_next
 
-    def __parse_meta(self):
-        parsed = self.__parsed
-        meta = parsed.sumario.meta
-        return {'date_next': meta.fechaSig.string}
-
-    def __parse_provinces(self):
-        parsed = self.__parsed
-        provinces = parsed.sumario.diario.find('seccion', {'num': 'A'}).findAll('item')
-
-        result = {}
-        for province in provinces:
-            result[province.titulo.string] = {
-                'size': province.urlPdf['szBytes'],
-                'url': province.urlPdf.string
-            }
-        return result
-
-    @property
-    def content(self):
-        meta = self.__parse_meta()
-        provinces = self.__parse_provinces()
-
-        return {**meta, **provinces}
+    def doc_by_province(self, name):
+        province = self.__summaryParsed.province_by_name(name)
+        if province:
+            return DocPDF(url=province.url)
+        else:
+            return None
 
 
-# summary = Summary(SummaryResource(datetime.date(2014, 1, 2)))
-# print(summary.content)
+class DocsPDF:
 
-
-class Doc:
-    url_base = 'https://www.boe.es/'
-
-    def __init__(self, date, province):
-        self.__date = date
+    def __init__(self, province, date_start, date_end=datetime.date.today()):
         self.__province = province
+        self.__date_start = date_start
+        self.__date_end = date_end
+        self.__date_next = None
 
-    @property
-    def __summary(self):
-        return Summary(SummaryResource(self.__date))
+    def __iter__(self):
+        return self
 
-    @property
-    def __url(self):
-        return urljoin(self.url_base, self.__summary.content[self.__province]['url'])
+    def __next__(self):
+        if self.__date_next is None:
+            self.__date_next = self.__date_start
 
-    def fetch(self):
-        """
-        remove the file write part, this class should just
-        download documents
-        """
+        summary = Summary(SummaryParsed(SummaryXML(self.__date_next)))
+        if summary.date_next is None or summary.date_next > self.__date_end:
+            raise StopIteration
+        else:
+            self.__date_next = summary.date_next
 
-        async def _fetch():
-            async with aiohttp.ClientSession() as session:
-                async with session.get(self.__url) as response:
-                    filename = os.path.basename(self.__url)
-                    with open(filename, 'wb') as f:
-                        while True:
-                            chunk = await response.content.read(1024)
-                            if not chunk:
-                                break;
-                            f.write(chunk)
+        doc = summary.doc_by_province(self.__province)
+        if doc:
+            return doc.content
+        else:
+            return self.__next__()
 
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(_fetch())
 
-# doc = Doc(datetime.date(2019, 2, 14), 'MADRID')
-# doc.fetch()
+# summary = Summary(SummaryParsed(SummaryXML(datetime.date(2019, 2, 22))))
+# print(summary.date_next)
+
+date_start = datetime.date(2019, 2, 20)
+date_end = datetime.date(2019, 2, 22)
+docs = DocsPDF('MADRID', date_start, date_end)
+
+i = 0
+for doc in docs:
+    with open('pdfs/' + str(i), 'wb') as f:
+        f.write(doc)
+    i += 1
